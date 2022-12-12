@@ -11,7 +11,7 @@ import { ScanCommandOptions } from '../commands/SCAN';
 import { HScanTuple } from '../commands/HSCAN';
 import { attachCommands, attachExtensions, fCallArguments, transformCommandArguments, transformCommandReply, transformLegacyCommandArguments } from '../commander';
 import { Pool, Options as PoolOptions, createPool } from 'generic-pool';
-import { ClientClosedError, DisconnectsClientError } from '../errors';
+import { ClientClosedError, ClientOfflineError, DisconnectsClientError } from '../errors';
 import { URL } from 'url';
 import { TcpSocketConnectOpts } from 'net';
 
@@ -31,6 +31,7 @@ export interface RedisClientOptions<
     readonly?: boolean;
     legacyMode?: boolean;
     isolationPoolOptions?: PoolOptions;
+    pingInterval?: number;
 }
 
 type WithCommands = {
@@ -281,9 +282,12 @@ export default class RedisClient<
                     this.#queue.flushAll(err);
                 }
             })
-            .on('connect', () => this.emit('connect'))
+            .on('connect', () => {
+                this.emit('connect');
+            })
             .on('ready', () => {
                 this.emit('ready');
+                this.#setPingTimer();
                 this.#tick();
             })
             .on('reconnecting', () => this.emit('reconnecting'))
@@ -348,6 +352,22 @@ export default class RedisClient<
             (...args: Array<unknown>): void => (this as any).sendCommand(name, ...args);
     }
 
+    #pingTimer?: NodeJS.Timer;
+
+    #setPingTimer(): void {
+        if (!this.#options?.pingInterval || !this.#socket.isReady) return;
+        clearTimeout(this.#pingTimer);
+
+        this.#pingTimer = setTimeout(() => {
+            if (!this.#socket.isReady) return;
+
+            (this as unknown as RedisClientType<M, F, S>).ping()
+                .then(reply => this.emit('ping-interval', reply))
+                .catch(err => this.emit('error', err))
+                .finally(() => this.#setPingTimer());
+        }, this.#options.pingInterval);
+    }
+
     duplicate(overrides?: Partial<RedisClientOptions<M, F, S>>): RedisClientType<M, F, S> {
         return new (Object.getPrototypeOf(this).constructor)({
             ...this.#options,
@@ -385,16 +405,16 @@ export default class RedisClient<
     ): Promise<T> {
         if (!this.#socket.isOpen) {
             return Promise.reject(new ClientClosedError());
-        }
-
-        if (options?.isolated) {
+        } else if (options?.isolated) {
             return this.executeIsolated(isolatedClient =>
                 isolatedClient.sendCommand(args, {
                     ...options,
                     isolated: false
                 })
             );
-        }
+        } else if (!this.#socket.isReady && this.#options?.disableOfflineQueue) {
+            return Promise.reject(new ClientOfflineError());
+        } 
 
         const promise = this.#queue.addCommand<T>(args, options);
         this.#tick();
@@ -599,18 +619,24 @@ export default class RedisClient<
         return this.#isolationPool.use(fn);
     }
 
-    multi(): RedisClientMultiCommandType<M, F, S> {
+    MULTI(): RedisClientMultiCommandType<M, F, S> {
         return new (this as any).Multi(
             this.multiExecutor.bind(this),
             this.#options?.legacyMode
         );
     }
 
+    multi = this.MULTI;
+
     async multiExecutor(
         commands: Array<RedisMultiQueuedCommand>,
         selectedDB?: number,
         chainId?: symbol
     ): Promise<Array<RedisCommandRawReply>> {
+        if (!this.#socket.isOpen) {
+            return Promise.reject(new ClientClosedError());
+        }
+
         const promise = Promise.all(
             commands.map(({ args }) => {
                 return this.#queue.addCommand(args, { chainId });

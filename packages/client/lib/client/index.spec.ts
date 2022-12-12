@@ -3,7 +3,7 @@ import testUtils, { GLOBAL, waitTillBeenCalled } from '../test-utils';
 import RedisClient, { RedisClientType } from '.';
 import { RedisClientMultiCommandType } from './multi-command';
 import { RedisCommandArguments, RedisCommandRawReply, RedisModules, RedisFunctions, RedisScripts } from '../commands';
-import { AbortError, ClientClosedError, ConnectionTimeoutError, DisconnectsClientError, SocketClosedUnexpectedlyError, WatchError } from '../errors';
+import { AbortError, ClientClosedError, ClientOfflineError, ConnectionTimeoutError, DisconnectsClientError, SocketClosedUnexpectedlyError, WatchError } from '../errors';
 import { defineScript } from '../lua-script';
 import { spy } from 'sinon';
 import { once } from 'events';
@@ -422,6 +422,19 @@ describe('Client', () => {
                     .addCommand(['INVALID COMMAND'])
                     .ping()
                     .exec()
+            );
+        }, GLOBAL.SERVERS.OPEN);
+
+        testUtils.testWithClient('should reject the whole chain upon client disconnect', async client => {
+            await client.disconnect();
+
+            return assert.rejects(
+                client.multi()
+                    .ping()
+                    .set('key', 'value')
+                    .get('key')
+                    .exec(),
+                ClientClosedError
             );
         }, GLOBAL.SERVERS.OPEN);
 
@@ -849,4 +862,32 @@ describe('Client', () => {
         client.unref();
         client.ref();
     }, GLOBAL.SERVERS.OPEN);
+
+    testUtils.testWithClient('pingInterval', async client => {
+        assert.deepEqual(
+            await once(client, 'ping-interval'),
+            ['PONG']
+        );
+    }, {
+        ...GLOBAL.SERVERS.OPEN,
+        clientOptions: {
+            pingInterval: 1
+        }
+    });
+
+    testUtils.testWithClient('should reject commands in connect phase when `disableOfflineQueue`', async client => {
+        const connectPromise = client.connect();
+        await assert.rejects(
+            client.ping(),
+            ClientOfflineError
+        );
+        await connectPromise;
+        await client.disconnect();
+    }, {
+        ...GLOBAL.SERVERS.OPEN,
+        clientOptions: {
+            disableOfflineQueue: true
+        },
+        disableClientSetup: true
+    });
 });
